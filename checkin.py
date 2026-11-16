@@ -27,6 +27,7 @@ logger = logging.getLogger("GLaDOS")
 
 # ==================== 配置 ====================
 CHECKIN_URL = "https://glados.cloud/api/user/checkin"
+CHALLENGE_URL = "https://glados.cloud/api/user/checkin/challenge"
 STATUS_URL = "https://glados.cloud/api/user/status"
 POINTS_URL = "https://glados.cloud/api/user/points"
 EXCHANGE_URL = "https://glados.cloud/api/user/exchange"
@@ -42,6 +43,9 @@ HEADERS_BASE = {
     # 此处无需（也不应）手动设置 content-type，否则与 requests 默认行为重复。
 }
 PAYLOAD = {"token": "glados.cloud"}
+# 签到 challenge：官网签到前需先获取一次性 nonce，等待后计算 proof 并随签到提交。
+CHALLENGE_SUFFIX = "glados-observe-v1"
+CHALLENGE_DELAY = 2.6
 TIMEOUT = (5, 15)  # (连接超时, 读取超时)
 MAX_RETRY = 3
 RETRY_MIN_WAIT = 2.0
@@ -587,10 +591,61 @@ def classify_checkin(code: Any, message: str) -> str:
     return "fail"
 
 
+def fetch_checkin_challenge(
+    session: requests.Session, headers: Dict[str, str]
+) -> Optional[Tuple[str, str]]:
+    """
+    获取签到 challenge 并计算 proof，成功返回 (nonce, proof)。
+
+    challenge 获取失败时返回 None，由调用方回退旧协议提交，避免网络异常
+    导致签到中断。
+    """
+    try:
+        r = session.get(CHALLENGE_URL, headers=headers, timeout=TIMEOUT)
+        r.raise_for_status()
+        j = require_json(r)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("获取签到 challenge 失败，将按旧协议提交: %s", e)
+        return None
+
+    if j.get("code") != 0:
+        logger.warning(
+            "签到 challenge 响应异常: code=%s message=%s",
+            j.get("code"),
+            j.get("message"),
+        )
+        return None
+    data = j.get("data") if isinstance(j.get("data"), dict) else {}
+    nonce = j.get("nonce") or data.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        logger.warning("签到 challenge 未返回有效 nonce，将按旧协议提交")
+        return None
+
+    ttl = j.get("ttl", data.get("ttl"))
+    if isinstance(ttl, (int, float)) and not isinstance(ttl, bool):
+        if ttl <= CHALLENGE_DELAY * 1000:
+            logger.warning("签到 challenge ttl 过短(%s ms)，将按旧协议提交", ttl)
+            return None
+
+    time.sleep(CHALLENGE_DELAY)
+    proof = hashlib.sha256(
+        f"{nonce}.{CHALLENGE_SUFFIX}".encode("utf-8")
+    ).hexdigest()
+    logger.info("已获取签到 challenge，等待 %.1f 秒后提交", CHALLENGE_DELAY)
+    return nonce, proof
+
+
 @retry_on_failure()
 def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
-    """执行签到请求（带重试）"""
-    r = session.post(CHECKIN_URL, headers=headers, json=PAYLOAD, timeout=TIMEOUT)
+    """执行签到请求（带重试）。每次尝试都重新获取一次性 challenge。"""
+    payload = dict(PAYLOAD)
+    challenge = fetch_checkin_challenge(session, headers)
+    if challenge:
+        nonce, proof = challenge
+        payload.update({"nonce": nonce, "proof": proof})
+    else:
+        logger.warning("未取得签到 challenge，按旧协议提交（可能只获得 1 积分）")
+    r = session.post(CHECKIN_URL, headers=headers, json=payload, timeout=TIMEOUT)
     r.raise_for_status()
     return require_json(r)  # 非 JSON 响应抛异常进入重试（M1）
 
